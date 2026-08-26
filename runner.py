@@ -2,11 +2,13 @@
 
     python runner.py --T 50 --seeds 3          # Gate-1 smoke run
     python runner.py --T 500 --seeds 20        # MVP result
+    python runner.py --T 500 --seeds 20 --log_episodes --out results_logs_mis
 """
 import argparse
 import csv
 import json
 import os
+from typing import Optional
 
 import numpy as np
 
@@ -16,6 +18,25 @@ from aumcdm.engine.baselines import make_suite
 
 DEFAULT_W0 = np.array([0.45, 0.40, 0.10, 0.05])
 MAX_STEPS = ToolSelectEnv.BUDGET + 2
+C_MAX = 0.30  # matches spend_eff definition in the paper
+
+
+# --------------------------------------------------------------------------- #
+# Episode logging (optional; never touches RNG)
+# --------------------------------------------------------------------------- #
+def _spend_eff(spend: float) -> float:
+    return float(max(0.0, 1.0 - float(spend) / C_MAX))
+
+
+def _write_episodes_csv(path: str, rows: list[dict]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=fieldnames)
+        wr.writeheader()
+        wr.writerows(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -29,7 +50,8 @@ def _random_action(env, w, cfg, rng):
     Qt = risk_adjust(Q, S, cfg.kappa)
     aux = {"qt": Qt[a].copy(), "u_exec": float(Qt[a] @ w), "u_top": np.nan,
            "a_top": a, "tau": float(cfg.tau0), "censored": False,
-           "forced": False, "propensity": 1.0 / len(idx)}
+           "forced": False, "propensity": 1.0 / len(idx),
+           "Qt": Qt}
     return a, aux
 
 
@@ -39,7 +61,8 @@ def _oracle_action(env, w, cfg):
     Qt = risk_adjust(Q, S, cfg.kappa)
     aux = {"qt": Qt[a].copy(), "u_exec": float(Qt[a] @ w), "u_top": np.nan,
            "a_top": a, "tau": float(cfg.tau0), "censored": False,
-           "forced": False, "propensity": 1.0}
+           "forced": False, "propensity": 1.0,
+           "Qt": Qt}
     return int(a), aux
 
 
@@ -56,7 +79,11 @@ def select(env, arm, w, rng):
 # One episode
 # --------------------------------------------------------------------------- #
 def run_episode(env, arm, adapter, rng):
-    """One episode. Returns metrics + per-decision censor/force counts."""
+    """One episode. Returns metrics + per-decision censor/force counts.
+
+    Extra keys for logging (no new randomness):
+      kind, success (0/1 or None), tool (int or None)
+    """
     env.reset()
     v_oracle = env.oracle_value()
     last_aux = None
@@ -69,7 +96,6 @@ def run_episode(env, arm, adapter, rng):
         a, aux = select(env, arm, w, rng)
         last_aux = aux
 
-        # count every decision (not only terminal)
         if aux.get("censored", False):
             n_cens += 1
             if aux.get("forced", False):
@@ -82,21 +108,33 @@ def run_episode(env, arm, adapter, rng):
             kind_hist[kname] += 1
             acted = (kind == "act")
 
+            # success / tool for logging (read-only from env outcome)
+            success = info.get("success", None)
+            if success is None and acted:
+                try:
+                    success = int(float(phi[0]) >= 0.5)
+                except Exception:
+                    success = None
+            if success is not None:
+                success = int(success)
+            tool = info.get("tool", None)
+            if tool is None and acted and a < env.K:
+                tool = int(a)
+
             # ---- B4_full: on abstain, reveal counterfactual of a_top and update ----
             if (getattr(arm, "full_feedback", False)
                     and kind == "abstain"
                     and aux.get("a_top") is not None
                     and aux["a_top"] < env.K):
                 k = int(aux["a_top"])
-                success = bool(rng.random() < env.ep.theta[k])
-                phi_cf = env.phi_terminal(k, success)
+                success_cf = bool(rng.random() < env.ep.theta[k])
+                phi_cf = env.phi_terminal(k, success_cf)
                 R_cf = env.reward(phi_cf)
-                # update on counterfactual action features, not abstain row
                 qt_cf = aux["Qt"][k] if "Qt" in aux else aux["qt"]
                 u_cf = float(aux["u_top"])
                 adapter.update(qt=qt_cf, u_exec=u_cf, R=R_cf,
                                propensity=1.0, terminal_acted=True)
-                R = env.reward(phi)  # realised abstain reward for metrics
+                R = env.reward(phi)
             else:
                 R = env.reward(phi)
                 adapter.update(qt=aux["qt"], u_exec=aux["u_exec"], R=R,
@@ -107,15 +145,20 @@ def run_episode(env, arm, adapter, rng):
                 "R": R,
                 "regret": float(v_oracle - R),
                 "abstained": kind == "abstain",
-                "harm": info.get("harm", 0.0),
-                "catastrophic": info.get("catastrophic", False),
+                "harm": float(info.get("harm", 0.0) or 0.0),
+                "catastrophic": bool(info.get("catastrophic", False)),
                 "censored": bool(aux["censored"]),
                 "forced": bool(aux["forced"]),
                 "n_cens": n_cens,
                 "n_forced": n_forced,
-                "spend": env.ep.spend,
+                "spend": float(env.ep.spend),
                 "steps": env.ep.steps,
                 "kind_hist": kind_hist,
+                "kind": kind,
+                "success": success if acted else None,
+                "tool": tool if acted else None,
+                "u_top": aux.get("u_top", None),
+                "a_top": aux.get("a_top", None),
             }
 
     # step cap: reservation outcome, no learning signal
@@ -127,8 +170,13 @@ def run_episode(env, arm, adapter, rng):
         "harm": 0.0, "catastrophic": False,
         "censored": bool(last_aux["censored"]) if last_aux else True,
         "forced": False, "n_cens": n_cens, "n_forced": n_forced,
-        "spend": env.ep.spend, "steps": env.ep.steps,
+        "spend": float(env.ep.spend), "steps": env.ep.steps,
         "kind_hist": kind_hist,
+        "kind": "abstain",
+        "success": None,
+        "tool": None,
+        "u_top": last_aux.get("u_top") if last_aux else None,
+        "a_top": last_aux.get("a_top") if last_aux else None,
     }
 
 
@@ -150,14 +198,69 @@ def slope(y):
     return float((x @ (y - y.mean())) / (x @ x))
 
 
-def run_arm(arm, T, seed, w_star, seed_base=10_000, log_every=10):
+def run_arm(arm, T, seed, w_star, seed_base=10_000, log_every=10,
+            log_episodes: bool = False, seed_set: str = "A", init: str = "misspec"):
     rng = np.random.default_rng(seed_base + seed)
     env = ToolSelectEnv(w_star, rng)
     adapter = arm.make_adapter()
 
     eps_hist, w_hist = [], []
+    episode_rows: list[dict] = []
+
     for t in range(T):
-        eps_hist.append(run_episode(env, arm, adapter, rng))
+        w_before = adapter.snapshot().copy()
+        n_before = int(getattr(adapter, "n_updates", 0))
+
+        e = run_episode(env, arm, adapter, rng)
+        eps_hist.append(e)
+
+        w_after = adapter.snapshot().copy()
+        n_this = int(getattr(adapter, "n_updates", 0)) - n_before
+
+        if log_episodes:
+            kind = e.get("kind", "other")
+            if kind == "act" and e.get("tool") is not None:
+                term_str = f"act_{int(e['tool'])}"
+            elif kind in ("abstain", "gather", "ask"):
+                term_str = kind
+            else:
+                term_str = str(kind)
+
+            success = e.get("success", None)
+            harm = e.get("harm", None)
+            if term_str == "abstain" or not term_str.startswith("act_"):
+                success = None
+            cat = int(bool(e.get("catastrophic", False)))
+
+            spend = float(e.get("spend", 0.0))
+            u_top = e.get("u_top", None)
+            try:
+                u_top_f = float(u_top) if u_top is not None and np.isfinite(
+                    u_top) else ""
+            except Exception:
+                u_top_f = ""
+
+            episode_rows.append({
+                "seed_set": seed_set,
+                "seed_id": int(seed),
+                "init": init,
+                "arm": arm.name,
+                "episode": int(t),
+                "terminal_action": term_str,
+                "success": "" if success is None else int(success),
+                "harm": "" if harm is None else float(harm),
+                "catastrophic": cat,
+                "reward": float(e["R"]),
+                "spend": spend,
+                "spend_eff": _spend_eff(spend),
+                "abstain_flag": int(term_str == "abstain"),
+                "n_updates": int(n_this),
+                "w2_before": float(w_before[1]),
+                "w2_after": float(w_after[1]),
+                "u_max": u_top_f,
+                "a_top": "" if e.get("a_top") is None else int(e["a_top"]),
+            })
+
         if t % log_every == 0:
             w_hist.append(adapter.snapshot())
     w_hist.append(adapter.snapshot())
@@ -172,7 +275,7 @@ def run_arm(arm, T, seed, w_star, seed_base=10_000, log_every=10):
         for k, v in e.get("kind_hist", {}).items():
             kh[k] = kh.get(k, 0) + int(v)
 
-    return {
+    out = {
         "arm": arm.name, "seed": seed,
         "mean_R": float(np.mean(R)),
         "cvar10": cvar(R, 0.10),
@@ -208,6 +311,22 @@ def run_arm(arm, T, seed, w_star, seed_base=10_000, log_every=10):
         "w_final": w_hist[-1].copy(),
         "w_hist": w_hist,
     }
+    if log_episodes:
+        out["_episode_rows"] = episode_rows
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Expected drift (fixed)
+# --------------------------------------------------------------------------- #
+def expected_drift(w0: np.ndarray, phi_means: np.ndarray) -> np.ndarray:
+    """Closed-form expected relative drift under multiplicative EG with fixed phi_means."""
+    w = w0.copy()
+    for _ in range(100):  # converges in <100 steps
+        phi = phi_means
+        denom = np.dot(w, np.exp(phi))
+        w = w * np.exp(phi) / denom
+    return w - w0
 
 
 # --------------------------------------------------------------------------- #
@@ -247,7 +366,6 @@ def report(rows, args, w_star, w0):
               f"{g(n, 'mean_spend'):7.3f}")
     print("-" * len(hdr))
 
-    # ---- Gate-1 sanity gates ------------------------------------------------
     print("\nGATE-1 SANITY")
     ab3 = g("B3_static", "abstain_rate")
     checks = [
@@ -275,7 +393,6 @@ def report(rows, args, w_star, w0):
     for label, ok, detail in checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {label:<48} {detail}")
 
-    # ---- Directional readout (NOT a test) ----------------------------------
     print("\nDIRECTIONAL READOUT  (predictions, not assertions)")
     for pid, label, vals in [
         ("P1", "B4 safety-weight drift < 0",
@@ -313,18 +430,31 @@ def main():
                    help="Set w0 = w* (aligned-start control)")
     p.add_argument("--seed_base", type=int, default=10_000,
                    help="RNG offset; use 20000 for held-out replication")
+    p.add_argument("--log_episodes", action="store_true",
+                   help="Write episode-level CSVs (no effect on RNG)")
+    p.add_argument("--seed_set", type=str, default=None,
+                   help="Label for logs: A or B (default: A if seed_base<20000 else B)")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     w_star = make_w_star(args.rho)
     w0 = w_star.copy() if args.aligned else DEFAULT_W0.copy()
+    init = "aligned" if args.aligned else "misspec"
+    seed_set = args.seed_set or ("B" if args.seed_base >= 20_000 else "A")
 
     rows, traj = [], []
+    episode_bags: dict[str, list] = {}
+
     for seed in range(args.seeds):
         for arm in make_suite(w0, alpha=args.alpha, eps=args.eps,
                               tau0=args.tau0, kappa=args.kappa, eta=args.eta):
             r = run_arm(arm, T=args.T, seed=seed, w_star=w_star,
-                        seed_base=args.seed_base)
+                        seed_base=args.seed_base,
+                        log_episodes=args.log_episodes,
+                        seed_set=seed_set, init=init)
+            if args.log_episodes and "_episode_rows" in r:
+                episode_bags.setdefault(arm.name, []).extend(
+                    r.pop("_episode_rows"))
             for i, w in enumerate(r["w_hist"]):
                 traj.append({"seed": seed, "arm": arm.name, "t": i * 10,
                              "w1": w[0], "w2": w[1], "w3": w[2], "w4": w[3]})
@@ -341,8 +471,16 @@ def main():
         wr.writeheader()
         wr.writerows(traj)
     with open(os.path.join(args.out, "config.json"), "w") as f:
-        json.dump(vars(args) | {"w_star": w_star.tolist(), "w0": w0.tolist()},
+        json.dump(vars(args) | {"w_star": w_star.tolist(), "w0": w0.tolist(),
+                                "init": init, "seed_set": seed_set},
                   f, indent=2)
+
+    if args.log_episodes:
+        for arm_name, erows in episode_bags.items():
+            path = os.path.join(
+                args.out, f"episodes_{seed_set}_{init}_{arm_name}.csv")
+            _write_episodes_csv(path, erows)
+            print(f"wrote {path}  ({len(erows)} rows)")
 
     report(rows, args, w_star, w0)
     print(f"wrote {args.out}/summary.csv, {args.out}/w_traj.csv, "
