@@ -32,8 +32,6 @@ from runner import run_arm, DEFAULT_W0
 
 # --------------------------------------------------------------------------- #
 # Single source of truth for the scale-invariant base threshold.
-# Calibrate with calibrate_tau_si.py so that abstain rate under
-# scale_invariant=True matches the fixed-rule rate (~0.20–0.22).
 # --------------------------------------------------------------------------- #
 TAU0_SI: float = 1.05          # <-- change only this constant after calibration
 
@@ -60,7 +58,6 @@ def _boot_ci(vals: list[float], n: int = 5000, seed: int = 0) -> tuple[float, fl
 
 
 def _tau_use(tau0: float, scale_invariant: bool) -> float:
-    """Return the base threshold that is handed to DecisionConfig."""
     return float(TAU0_SI) if scale_invariant else float(tau0)
 
 
@@ -92,7 +89,6 @@ def run_eta_sweep(
         )
         static_arm = next(a for a in suite if a.name == "B3_static")
 
-        # Ensure the flag is present even if make_suite is an older snapshot
         if hasattr(static_arm, "cfg") and hasattr(static_arm.cfg, "scale_invariant"):
             static_arm.cfg.scale_invariant = bool(scale_invariant)
         elif hasattr(static_arm, "cfg"):
@@ -105,20 +101,12 @@ def run_eta_sweep(
 
         seed_rows = []
         for seed in range(seeds):
-            r = run_arm(
-                static_arm,
-                T=T,
-                seed=seed,
-                w_star=w_star,
-                seed_base=seed_base,
-                log_episodes=False,
-            )
+            r = run_arm(static_arm, T=T, seed=seed, w_star=w_star,
+                        seed_base=seed_base, log_episodes=False)
             seed_rows.append(r)
 
         means = _mean_row(
-            seed_rows,
-            ["mean_R", "cvar10", "abstain_rate", "catastrophic_rate", "w2_final"],
-        )
+            seed_rows, ["mean_R", "cvar10", "abstain_rate", "catastrophic_rate", "w2_final"])
         cvar_lo, cvar_hi = _boot_ci([r["cvar10"] for r in seed_rows])
         abs_lo, abs_hi = _boot_ci([r["abstain_rate"] for r in seed_rows])
 
@@ -144,11 +132,7 @@ def run_eta_sweep(
             "tau_eff": tau_eff,
         })
         print(
-            f"eta={eta:.2f}  scale={scale_invariant}  "
-            f"CVaR={means['cvar10']:.4f}  abs={means['abstain_rate']:.3f}  "
-            f"L1={records[-1]['L1_to_wstar']:.3f}  "
-            f"||w||={w_norm:.4f}  tau_eff={tau_eff:.4f}"
-        )
+            f"eta={eta:.2f}  scale={scale_invariant}  CVaR={means['cvar10']:.4f}  abs={means['abstain_rate']:.3f}  L1={records[-1]['L1_to_wstar']:.3f}  ||w||={w_norm:.4f}  tau_eff={tau_eff:.4f}")
 
     return pd.DataFrame(records)
 
@@ -172,27 +156,20 @@ def run_adaptive_compare(
 
     for scale_inv in (False, True):
         tau_use = _tau_use(tau0, scale_inv)
-        suite = make_suite(
-            w0, alpha=alpha, eps=0.10, tau0=tau_use, kappa=1.0, eta=0.0,
-            scale_invariant=bool(scale_inv),
-        )
+        suite = make_suite(w0, alpha=alpha, eps=0.10, tau0=tau_use,
+                           kappa=1.0, eta=0.0, scale_invariant=bool(scale_inv))
         skip = next(a for a in suite if a.name == "B4_eg_skip")
         static = next(a for a in suite if a.name == "B3_static")
 
         for arm in (static, skip):
             seed_rows = []
             for seed in range(seeds):
-                r = run_arm(
-                    arm, T=T, seed=seed, w_star=w_star,
-                    seed_base=seed_base, log_episodes=False,
-                )
+                r = run_arm(arm, T=T, seed=seed, w_star=w_star,
+                            seed_base=seed_base, log_episodes=False)
                 seed_rows.append(r)
 
-            means = _mean_row(
-                seed_rows,
-                ["mean_R", "cvar10", "abstain_rate", "catastrophic_rate",
-                 "w2_drift", "w2_final"],
-            )
+            means = _mean_row(seed_rows, [
+                              "mean_R", "cvar10", "abstain_rate", "catastrophic_rate", "w2_drift", "w2_final"])
             cvar_lo, cvar_hi = _boot_ci([r["cvar10"] for r in seed_rows])
             records.append({
                 "arm": arm.name,
@@ -204,16 +181,13 @@ def run_adaptive_compare(
                 "tau_use": tau_use,
             })
             print(
-                f"{arm.name:12s} scale={scale_inv} aligned={aligned}  "
-                f"CVaR={means['cvar10']:.4f} abs={means['abstain_rate']:.3f} "
-                f"w2_drift={means.get('w2_drift', float('nan')):+.4f}"
-            )
+                f"{arm.name:12s} scale={scale_inv} aligned={aligned}  CVaR={means['cvar10']:.4f} abs={means['abstain_rate']:.3f} w2_drift={means.get('w2_drift', float('nan')):+.4f}")
 
     return pd.DataFrame(records)
 
 
 # --------------------------------------------------------------------------- #
-# Plots
+# Plotting functions
 # --------------------------------------------------------------------------- #
 
 def plot_eta(df: pd.DataFrame, path: str) -> None:
@@ -224,9 +198,9 @@ def plot_eta(df: pd.DataFrame, path: str) -> None:
         label = "scale-inv" if scale else "fixed τ₀"
         ax.plot(g["eta"], g["cvar10"], "o-", label=label)
         ax.fill_between(g["eta"], g["cvar10_lo"], g["cvar10_hi"], alpha=0.18)
-    ax.set_xlabel("η  (w = (1-η)w₀ + η w*)")
+    ax.set_xlabel("η (interpolation weight)")
     ax.set_ylabel("CVaR@10")
-    ax.set_title("η-interpolation (static)")
+    ax.set_title("CVaR@10 vs η-interpolation")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=160)
@@ -236,21 +210,49 @@ def plot_eta(df: pd.DataFrame, path: str) -> None:
 
 def plot_scale(df: pd.DataFrame, path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    arms = ["B3_static", "B4_eg_skip"]
-    fig, ax = plt.subplots(figsize=(6.0, 4.0))
-    x = np.arange(len(arms))
-    width = 0.35
-    for i, scale in enumerate([False, True]):
-        sub = df[df["scale_invariant"] == scale].set_index("arm").reindex(arms)
-        ax.bar(x + (i - 0.5) * width, sub["cvar10"], width,
-               yerr=[sub["cvar10"] - sub["cvar10_lo"],
-                     sub["cvar10_hi"] - sub["cvar10"]],
-               capsize=3,
-               label="scale-inv" if scale else "fixed τ₀")
-    ax.set_xticks(x)
-    ax.set_xticklabels(arms)
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    for scale, g in df.groupby("scale_invariant"):
+        g = g.sort_values("arm")
+        label = "scale-inv" if scale else "fixed τ₀"
+        # Plot points with error bars
+        ax.errorbar(g["arm"], g["cvar10"],
+                    yerr=[g["cvar10"] - g["cvar10_lo"],
+                          g["cvar10_hi"] - g["cvar10"]],
+                    fmt="o-", label=label, capsize=4)
+    ax.set_xlabel("Arm")
     ax.set_ylabel("CVaR@10")
+    aligned_status = "Aligned" if df["aligned"].iloc[0] else "Misspecified"
+    ax.set_title(f"Scale-invariant vs Fixed τ₀ ({aligned_status})")
     ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
+def plot_coverage(df: pd.DataFrame, path: str) -> None:
+    """
+    CVaR@10 vs realised abstention rate using the full span of
+    η-path + adaptive points (fixed vs scale-invariant).
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.8, 4.4))
+
+    for scale, g in df.groupby("scale_invariant"):
+        g = g.sort_values("abstain_rate")
+        label = "scale-inv" if scale else "fixed τ₀"
+        ax.plot(g["abstain_rate"], g["cvar10"],
+                "o-", label=label, markersize=7)
+        if "cvar10_lo" in g.columns and "cvar10_hi" in g.columns:
+            ax.fill_between(
+                g["abstain_rate"], g["cvar10_lo"], g["cvar10_hi"], alpha=0.18
+            )
+
+    ax.set_xlabel("Abstain rate (fraction of episodes)")
+    ax.set_ylabel("CVaR@10")
+    ax.set_title("CVaR@10 vs realised abstention rate (exploratory)")
+    ax.legend(loc="best")
+    ax.set_xlim(0.12, 0.26)          # full paper range
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -278,15 +280,11 @@ def main() -> None:
 
     # --- M4: η curve under fixed τ0 ---
     print("=== η-interpolation (fixed τ0) ===")
-    df_eta_fixed = run_eta_sweep(
-        etas, args.T, args.seeds, args.rho, args.tau0, args.alpha,
-        args.seed_base, scale_invariant=False,
-    )
+    df_eta_fixed = run_eta_sweep(etas, args.T, args.seeds, args.rho,
+                                 args.tau0, args.alpha, args.seed_base, scale_invariant=False)
     print("=== η-interpolation (scale-invariant τ) ===")
-    df_eta_scale = run_eta_sweep(
-        etas, args.T, args.seeds, args.rho, args.tau0, args.alpha,
-        args.seed_base, scale_invariant=True,
-    )
+    df_eta_scale = run_eta_sweep(etas, args.T, args.seeds, args.rho,
+                                 args.tau0, args.alpha, args.seed_base, scale_invariant=True)
     df_eta = pd.concat([df_eta_fixed, df_eta_scale], ignore_index=True)
     eta_path = os.path.join(args.out, "ablation_eta.csv")
     df_eta.to_csv(eta_path, index=False)
@@ -296,25 +294,38 @@ def main() -> None:
     # --- M3: adaptive skip fixed vs scale-invariant ---
     print("=== Adaptive compare (misspec) ===")
     df_mis = run_adaptive_compare(
-        args.T, args.seeds, args.rho, args.tau0, args.alpha,
-        args.seed_base, aligned=False,
-    )
+        args.T, args.seeds, args.rho, args.tau0, args.alpha, args.seed_base, aligned=False)
     print("=== Adaptive compare (aligned) ===")
     df_al = run_adaptive_compare(
-        args.T, args.seeds, args.rho, args.tau0, args.alpha,
-        args.seed_base, aligned=True,
-    )
+        args.T, args.seeds, args.rho, args.tau0, args.alpha, args.seed_base, aligned=True)
     df_ad = pd.concat([df_mis, df_al], ignore_index=True)
     ad_path = os.path.join(args.out, "ablation_scale.csv")
     df_ad.to_csv(ad_path, index=False)
     print(f"wrote {ad_path}")
-    plot_scale(
-        df_ad[df_ad["aligned"] == False],
-        os.path.join(args.out, "figures", "scale_compare_misspec.png"),
+    plot_scale(df_ad[df_ad["aligned"] == False], os.path.join(
+        args.out, "figures", "scale_compare_misspec.png"))
+    plot_scale(df_ad[df_ad["aligned"] == True], os.path.join(
+        args.out, "figures", "scale_compare_aligned.png"))
+
+    # --- CVaR vs realised coverage (full span = η-path + adaptive) ---
+    print("=== CVaR vs realised coverage (exploratory, full span) ===")
+    # η-path already has the wide coverage range; adaptive adds the skip points
+    df_cov = pd.concat(
+        [
+            df_eta[["scale_invariant", "abstain_rate",
+                    "cvar10", "cvar10_lo", "cvar10_hi"]],
+            df_ad[["scale_invariant", "abstain_rate",
+                   "cvar10", "cvar10_lo", "cvar10_hi"]],
+        ],
+        ignore_index=True,
     )
-    plot_scale(
-        df_ad[df_ad["aligned"] == True],
-        os.path.join(args.out, "figures", "scale_compare_aligned.png"),
+    # drop exact duplicates that appear in both tables
+    df_cov = df_cov.drop_duplicates(
+        subset=["scale_invariant", "abstain_rate", "cvar10"]
+    ).sort_values(["scale_invariant", "abstain_rate"])
+    plot_coverage(
+        df_cov,
+        os.path.join(args.out, "figures", "cvar_vs_coverage.png"),
     )
 
 

@@ -9,7 +9,7 @@ Actions
 
 Criteria (M = 4), all oriented "higher is better", all in [0, 1]
     0  task value        expected success
-    1  safety            1 - harm_k * P(failure)
+    1  safety            1 - harm_k * P(failure)   [canonical; primary runs]
     2  cost efficiency   1 - spend / C_MAX
     3  epistemic gain    normalised expected variance reduction
 """
@@ -129,10 +129,12 @@ class ToolSelectEnv:
         Q = np.zeros((self.N_ACTIONS, M))
         S = np.zeros((self.N_ACTIONS, M))
 
-        def eff(extra): return max(0.0, 1.0 - (sp + extra) / C_MAX)
+        def eff(extra):
+            return max(0.0, 1.0 - (sp + extra) / C_MAX)
 
         # --- Act(k): terminal ------------------------------------------------
         Q[:K, 0] = mu
+        # Canonical safety (primary runs / paper): 1 - HARM * P(failure)
         Q[:K, 1] = 1.0 - HARM * (1.0 - mu)
         Q[:K, 2] = eff(0.0)
         Q[:K, 3] = 0.0
@@ -194,7 +196,9 @@ class ToolSelectEnv:
         if a == self.ABSTAIN:
             return np.array([0.0, 1.0, sp_eff, 0.0])
         s = float(bool(success))
-        return np.array([s, 1.0 - HARM[a] * (1.0 - s), sp_eff, 0.0])
+        # Canonical safety (must match score() Act block)
+        safety = 1.0 - HARM[a] * (1.0 - s)
+        return np.array([s, safety, sp_eff, 0.0])
 
     # ----------------------------------------------------------- transition
     def step(self, a):
@@ -240,6 +244,7 @@ class ToolSelectEnv:
         to any learning arm; used only as a normaliser."""
         th = self.ep.theta
         sp_eff = max(0.0, 1.0 - self.ep.spend / C_MAX)
+        # Canonical safety (same as phi / reward model)
         val = (self.w_star[0] * th
                + self.w_star[1] * (1.0 - HARM * (1.0 - th))
                + self.w_star[2] * sp_eff)

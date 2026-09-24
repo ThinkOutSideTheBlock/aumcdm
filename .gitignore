@@ -60,3 +60,14 @@ revision3_fail_by_tool.csv
 
 # Optional: keep scripts, ignore only their out/ subdirs
 # (scripts themselves should be tracked)
+
+# Extra result / smoke dirs that may not match results_*/
+results_EA_check/
+results_flip_safety/
+results_smoke_canon/
+
+# Any future local CSVs / figures
+*.csv
+!requirements.txt
+ablation_out/
+**/figures/
