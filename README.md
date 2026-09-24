@@ -172,7 +172,7 @@ If you use this code, please cite the paper (preprint / venue version when avail
 
 ## License
 
-[Add a LICENSE file, e.g. MIT or Apache-2.0, and name it here.]
+MIT License (see LICENSE file).
 
 ---
 
